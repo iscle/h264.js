@@ -1,9 +1,12 @@
 cmake_minimum_required(VERSION 3.28)
-project(h264_js C)
+project(h264 C)
 
+# Use C11
 set(CMAKE_C_STANDARD 11)
 
-add_library(h264_js STATIC library.c
+# Add all source files
+set(H264_SOURCES
+        h264.c
         src/h264bsd_byte_stream.c
         src/h264bsd_cavlc.c
         src/h264bsd_conceal.c
@@ -32,4 +35,38 @@ add_library(h264_js STATIC library.c
         src/H264SwDecApi.c
 )
 
-target_include_directories(h264_js PUBLIC inc)
+# Include directories
+include_directories(inc)
+
+# Add executable target
+add_executable(h264 ${H264_SOURCES})
+
+# Compiler flags for warnings and optimization
+target_compile_options(h264 PRIVATE -Wall -Wextra -Wpedantic)
+
+# Emscripten-specific settings
+if(EMSCRIPTEN)
+    message(STATUS "Building with Emscripten")
+
+    # Target link options
+    target_link_options(h264 PRIVATE
+            "-sSTRICT"
+            "-sALLOW_TABLE_GROWTH=1"
+            "-sALLOW_MEMORY_GROWTH=1"
+            "-sINITIAL_HEAP=33554432" # 32MB (default is 16MB)
+            "-sEXPORTED_RUNTIME_METHODS=HEAPU8,addFunction"
+            "-sMODULARIZE=1"
+            "-sEXPORT_NAME=createH264"
+            "-sEXPORTED_FUNCTIONS=_h264_init,_h264_set_callback,_h264_decode,_h264_release"
+    )
+
+    # Apply optimization only for non Debug builds
+    if(NOT CMAKE_BUILD_TYPE STREQUAL "Debug")
+        message(STATUS "Applying optimizations for non-Debug build")
+
+        target_link_options(h264 PRIVATE
+                "-O3"
+                "-flto"
+        )
+    endif()
+endif()
