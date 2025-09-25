@@ -495,7 +495,7 @@ H264SwDecRet H264SwDecDecode(H264SwDecInst decInst, H264SwDecInput *pInput,
 
 ------------------------------------------------------------------------------*/
 
-H264SwDecApiVersion H264SwDecGetAPIVersion()
+H264SwDecApiVersion H264SwDecGetAPIVersion(void)
 {
     H264SwDecApiVersion ver;
 
