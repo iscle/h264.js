@@ -1,9 +1,8 @@
 #include "H264SwDecApi.h"
 #include <stdint.h>
-
-#ifdef __EMSCRIPTEN__
+#include <stdlib.h>
+#include <string.h>
 #include <emscripten/emscripten.h>
-#endif
 
 // Decoder state
 static H264SwDecInst decInst = NULL;
@@ -17,91 +16,196 @@ static uint32_t picDecodeNumber;
 // Picture callback pointer (JS registers this)
 static void (*pictureCallback)(uint8_t *yuv, int width, int height) = NULL;
 
+// Stream buffer for accumulating incomplete NAL units
+static uint8_t *streamBuffer = NULL;
+static size_t streamBufferSize = 0;
+static size_t streamBufferCapacity = 0;
+static int headersReceived = 0;
+
+#define INITIAL_BUFFER_CAPACITY (64 * 1024)  // 64KB initial capacity
+
 /*----------------------------- Initialization -----------------------------*/
-#ifdef __EMSCRIPTEN__
 EMSCRIPTEN_KEEPALIVE
-#endif
 int h264_init(int disableReordering) {
     if (decInst) return 0; // already initialized
 
     H264SwDecRet ret = H264SwDecInit(&decInst, disableReordering ? 1 : 0);
     if (ret != H264SWDEC_OK) return -1;
 
+    // Initialize stream buffer
+    streamBufferCapacity = INITIAL_BUFFER_CAPACITY;
+    streamBuffer = (uint8_t *)malloc(streamBufferCapacity);
+    if (!streamBuffer) {
+        H264SwDecRelease(decInst);
+        decInst = NULL;
+        return -1;
+    }
+    streamBufferSize = 0;
+    headersReceived = 0;
+
     picDecodeNumber = 0;
     return 0;
 }
 
 /*---------------------------- Set Picture Callback ------------------------*/
-#ifdef __EMSCRIPTEN__
 EMSCRIPTEN_KEEPALIVE
-#endif
 void h264_set_callback(void (*cb)(uint8_t *yuv, int width, int height)) {
     pictureCallback = cb;
 }
 
 /*---------------------------- Decode H.264 Buffer ------------------------*/
-#ifdef __EMSCRIPTEN__
 EMSCRIPTEN_KEEPALIVE
-#endif
 int h264_decode(uint8_t *buffer, size_t length) {
     if (!decInst || !buffer || length == 0) return -1;
 
-    decInput.pStream = buffer;
-    decInput.dataLen = length;
-    decInput.picId = picDecodeNumber;
-    decInput.intraConcealmentMethod = 0; // gray concealment
-
-    H264SwDecRet ret = H264SwDecDecode(decInst, &decInput, &decOutput);
-
-    switch (ret) {
-        // Headers ready
-        case H264SWDEC_HDRS_RDY_BUFF_NOT_EMPTY: {
-            H264SwDecGetInfo(decInst, &decInfo);  // query video info
-            decInput.dataLen -= decOutput.pStrmCurrPos - decInput.pStream;
-            decInput.pStream = decOutput.pStrmCurrPos;
-            break;
+    // Ensure we have enough capacity in the buffer
+    if (streamBufferSize + length > streamBufferCapacity) {
+        size_t newCapacity = streamBufferCapacity;
+        while (newCapacity < streamBufferSize + length) {
+            newCapacity *= 2;
         }
-
-        // Picture(s) ready
-        case H264SWDEC_PIC_RDY:
-        case H264SWDEC_PIC_RDY_BUFF_NOT_EMPTY: {
-            decInput.dataLen -= decOutput.pStrmCurrPos - decInput.pStream;
-            decInput.pStream = decOutput.pStrmCurrPos;
-
-            picDecodeNumber++; // increment after decoding
-
-            while (H264SwDecNextPicture(decInst, &decPicture, 0) == H264SWDEC_PIC_RDY) {
-                if (pictureCallback && decPicture.pOutputPicture) {
-                    pictureCallback((uint8_t *) decPicture.pOutputPicture,
-                                    (int) decInfo.picWidth,
-                                    (int) decInfo.picHeight);
-                }
-            }
-            break;
+        uint8_t *newBuffer = (uint8_t *)realloc(streamBuffer, newCapacity);
+        if (!newBuffer) {
+            return -1; // Out of memory
         }
-
-        // Stream processed but no picture ready
-        case H264SWDEC_STRM_PROCESSED:
-        case H264SWDEC_STRM_ERR: {
-            decInput.dataLen = 0;  // feed more data
-            break;
-        }
-
-        default:
-            // optional: handle unexpected values or ignore
-            break;
+        streamBuffer = newBuffer;
+        streamBufferCapacity = newCapacity;
     }
 
-    return ret;
+    // Append new data to the buffer
+    memcpy(streamBuffer + streamBufferSize, buffer, length);
+    streamBufferSize += length;
+
+    // Try to decode from the accumulated buffer
+    int lastRet = H264SWDEC_STRM_PROCESSED;
+    
+    while (streamBufferSize > 0) {
+        decInput.pStream = streamBuffer;
+        decInput.dataLen = streamBufferSize;
+        decInput.picId = picDecodeNumber;
+        decInput.intraConcealmentMethod = 0; // gray concealment
+
+        H264SwDecRet ret = H264SwDecDecode(decInst, &decInput, &decOutput);
+        lastRet = ret;
+
+        // Calculate how many bytes were consumed
+        size_t bytesConsumed = 0;
+        if (decOutput.pStrmCurrPos && decOutput.pStrmCurrPos >= streamBuffer) {
+            bytesConsumed = decOutput.pStrmCurrPos - streamBuffer;
+        }
+
+        switch (ret) {
+            // Headers ready
+            case H264SWDEC_HDRS_RDY_BUFF_NOT_EMPTY: {
+                H264SwDecGetInfo(decInst, &decInfo);  // query video info
+                headersReceived = 1;
+                
+                // Remove consumed bytes from buffer
+                if (bytesConsumed > 0 && bytesConsumed <= streamBufferSize) {
+                    memmove(streamBuffer, streamBuffer + bytesConsumed, 
+                            streamBufferSize - bytesConsumed);
+                    streamBufferSize -= bytesConsumed;
+                }
+                // Continue processing remaining data
+                continue;
+            }
+
+            // Picture(s) ready
+            case H264SWDEC_PIC_RDY:
+            case H264SWDEC_PIC_RDY_BUFF_NOT_EMPTY: {
+                picDecodeNumber++; // increment after decoding
+
+                // Output all ready pictures
+                while (H264SwDecNextPicture(decInst, &decPicture, 0) == H264SWDEC_PIC_RDY) {
+                    if (pictureCallback && decPicture.pOutputPicture) {
+                        pictureCallback((uint8_t *) decPicture.pOutputPicture,
+                                        (int) decInfo.picWidth,
+                                        (int) decInfo.picHeight);
+                    }
+                }
+
+                // Remove consumed bytes from buffer
+                if (bytesConsumed > 0 && bytesConsumed <= streamBufferSize) {
+                    memmove(streamBuffer, streamBuffer + bytesConsumed, 
+                            streamBufferSize - bytesConsumed);
+                    streamBufferSize -= bytesConsumed;
+                }
+                
+                // Continue processing if buffer not empty
+                if (ret == H264SWDEC_PIC_RDY_BUFF_NOT_EMPTY && streamBufferSize > 0) {
+                    continue;
+                }
+                return ret;
+            }
+
+            // Stream processed but no picture ready
+            case H264SWDEC_STRM_PROCESSED: {
+                // All current data processed, need more data
+                // Remove consumed bytes from buffer
+                if (bytesConsumed > 0 && bytesConsumed <= streamBufferSize) {
+                    memmove(streamBuffer, streamBuffer + bytesConsumed, 
+                            streamBufferSize - bytesConsumed);
+                    streamBufferSize -= bytesConsumed;
+                }
+                return ret;
+            }
+
+            // Stream error
+            case H264SWDEC_STRM_ERR: {
+                // Try to recover by removing consumed bytes
+                if (bytesConsumed > 0 && bytesConsumed <= streamBufferSize) {
+                    memmove(streamBuffer, streamBuffer + bytesConsumed, 
+                            streamBufferSize - bytesConsumed);
+                    streamBufferSize -= bytesConsumed;
+                } else if (streamBufferSize > 0) {
+                    // Skip one byte and try again (error recovery)
+                    memmove(streamBuffer, streamBuffer + 1, streamBufferSize - 1);
+                    streamBufferSize -= 1;
+                }
+                
+                // If no more data, return the error
+                if (streamBufferSize == 0) {
+                    return ret;
+                }
+                // Otherwise try to continue
+                continue;
+            }
+
+            default:
+                // For any other return value, remove consumed bytes and exit
+                if (bytesConsumed > 0 && bytesConsumed <= streamBufferSize) {
+                    memmove(streamBuffer, streamBuffer + bytesConsumed, 
+                            streamBufferSize - bytesConsumed);
+                    streamBufferSize -= bytesConsumed;
+                }
+                return ret;
+        }
+    }
+
+    return lastRet;
+}
+
+/*----------------------------- Reset Stream Buffer ------------------------*/
+EMSCRIPTEN_KEEPALIVE
+void h264_reset_buffer(void) {
+    streamBufferSize = 0;
+    headersReceived = 0;
 }
 
 /*----------------------------- Release Decoder ---------------------------*/
-#ifdef __EMSCRIPTEN__
 EMSCRIPTEN_KEEPALIVE
-#endif
 void h264_release(void) {
     if (decInst) {
         H264SwDecRelease(decInst);
         decInst = NULL;
     }
+    
+    // Free stream buffer
+    if (streamBuffer) {
+        free(streamBuffer);
+        streamBuffer = NULL;
+    }
+    streamBufferSize = 0;
+    streamBufferCapacity = 0;
+    headersReceived = 0;
 }

@@ -1,10 +1,9 @@
 cmake_minimum_required(VERSION 3.28)
 project(h264 C)
 
-# Use C11
 set(CMAKE_C_STANDARD 11)
 
-# Add all source files
+# Source files
 set(H264_SOURCES
         h264.c
         src/h264bsd_byte_stream.c
@@ -35,38 +34,38 @@ set(H264_SOURCES
         src/H264SwDecApi.c
 )
 
-# Include directories
-include_directories(inc)
-
-# Add executable target
 add_executable(h264 ${H264_SOURCES})
 
-# Compiler flags for warnings and optimization
-target_compile_options(h264 PRIVATE -Wall -Wextra -Wpedantic)
+target_include_directories(h264 PRIVATE inc)
 
-# Emscripten-specific settings
-if(EMSCRIPTEN)
-    message(STATUS "Building with Emscripten")
+# Compile options
+target_compile_options(h264 PRIVATE
+        -Wall
+        -Wextra
+        -Wpedantic
+        -O3
+        -msimd128
+        -msse2
+        -msse4.1
+        -ffast-math
+        -fomit-frame-pointer
+        -fno-signed-zeros
+        -fno-trapping-math
+        -fassociative-math
+)
 
-    # Target link options
-    target_link_options(h264 PRIVATE
-            "-sSTRICT"
-            "-sALLOW_TABLE_GROWTH=1"
-            "-sALLOW_MEMORY_GROWTH=1"
-            "-sINITIAL_HEAP=33554432" # 32MB (default is 16MB)
-            "-sEXPORTED_RUNTIME_METHODS=HEAPU8,addFunction"
-            "-sMODULARIZE=1"
-            "-sEXPORT_NAME=createH264"
-            "-sEXPORTED_FUNCTIONS=_h264_init,_h264_set_callback,_h264_decode,_h264_release"
-    )
-
-    # Apply optimization only for non Debug builds
-    if(NOT CMAKE_BUILD_TYPE STREQUAL "Debug")
-        message(STATUS "Applying optimizations for non-Debug build")
-
-        target_link_options(h264 PRIVATE
-                "-O3"
-                "-flto"
-        )
-    endif()
-endif()
+# Link options
+target_link_options(h264 PRIVATE
+        -sSTRICT
+        -sALLOW_TABLE_GROWTH=1
+        -sALLOW_MEMORY_GROWTH=1
+        -sINITIAL_HEAP=33554432
+        -sEXPORTED_RUNTIME_METHODS=HEAPU8,addFunction
+        -sMODULARIZE=1
+        -sEXPORT_NAME=createH264
+        -sEXPORTED_FUNCTIONS=_h264_init,_h264_set_callback,_h264_decode,_h264_reset_buffer,_h264_release,_malloc,_free
+        -msimd128
+        -O3
+        -flto
+        -ffast-math
+)
