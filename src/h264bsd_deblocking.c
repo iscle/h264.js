@@ -52,6 +52,8 @@
 #include "h264bsd_macroblock_layer.h"
 #include "h264bsd_deblocking.h"
 #include "h264bsd_dpb.h"
+#include <emmintrin.h>
+#include <wasm_simd128.h>
 
 #ifdef H264DEC_OMXDL
 #include "omxtypes.h"
@@ -655,6 +657,9 @@ void FilterVerLumaEdge(
 
 /* Variables */
 
+    // WASM SIMD variables
+    v128_t v_alpha, v_beta;
+    u8 p0_arr[4], q0_arr[4], p1_arr[4], q1_arr[4], p2_arr[4], q2_arr[4];
     i32 delta, tc, tmp;
     u32 i;
     u8 p0, q0, p1, q1, p2, q2;
@@ -667,6 +672,95 @@ void FilterVerLumaEdge(
     ASSERT(bS && bS <= 4);
     ASSERT(thresholds);
 
+    // Try SIMD path for processing all 4 pixels at once (strong filter, bS == 4)
+    if (bS >= 4)
+    {
+        // Load 4 pixels vertically for p2, p1, p0, q0, q1, q2
+        for (i = 0; i < 4; i++)
+        {
+            u8 *ptr = data + i * imageWidth;
+            p2_arr[i] = ptr[-3];
+            p1_arr[i] = ptr[-2];
+            p0_arr[i] = ptr[-1];
+            q0_arr[i] = ptr[0];
+            q1_arr[i] = ptr[1];
+            q2_arr[i] = ptr[2];
+        }
+
+        // Helper macro to build v128_t from 4 u8 values in lanes 0-3
+        #define V128_FROM_U8x4(a0, a1, a2, a3) \
+            wasm_i8x16_make((i8)(a0), (i8)(a1), (i8)(a2), (i8)(a3), \
+                            0,0,0,0,0,0,0,0,0,0,0,0)
+
+        v128_t v_p0 = V128_FROM_U8x4(p0_arr[0], p0_arr[1], p0_arr[2], p0_arr[3]);
+        v128_t v_q0 = V128_FROM_U8x4(q0_arr[0], q0_arr[1], q0_arr[2], q0_arr[3]);
+        v128_t v_p1 = V128_FROM_U8x4(p1_arr[0], p1_arr[1], p1_arr[2], p1_arr[3]);
+        v128_t v_q1 = V128_FROM_U8x4(q1_arr[0], q1_arr[1], q1_arr[2], q1_arr[3]);
+
+        // Compute absolute differences: |a - b| = max(a,b) - min(a,b) for u8
+        v128_t diff_p0_q0 = wasm_i8x16_sub(wasm_u8x16_max(v_p0, v_q0), wasm_u8x16_min(v_p0, v_q0));
+        v128_t diff_p1_p0 = wasm_i8x16_sub(wasm_u8x16_max(v_p1, v_p0), wasm_u8x16_min(v_p1, v_p0));
+        v128_t diff_q1_q0 = wasm_i8x16_sub(wasm_u8x16_max(v_q1, v_q0), wasm_u8x16_min(v_q1, v_q0));
+
+        // Broadcast thresholds
+        v_alpha = wasm_i8x16_splat((i8)thresholds->alpha);
+        v_beta  = wasm_i8x16_splat((i8)thresholds->beta);
+
+        // Check main deblocking conditions
+        v128_t cond1 = wasm_u8x16_lt(diff_p0_q0, v_alpha);
+        v128_t cond2 = wasm_u8x16_lt(diff_p1_p0, v_beta);
+        v128_t cond3 = wasm_u8x16_lt(diff_q1_q0, v_beta);
+        v128_t mask = wasm_v128_and(wasm_v128_and(cond1, cond2), cond3);
+
+        // Extract per-lane mask (bits 0-3 correspond to lanes 0-3)
+        u32 mask_bits = wasm_i8x16_bitmask(mask);
+
+        // Process each of the 4 vertical pixels conditionally
+        for (i = 0; i < 4; i++)
+        {
+            if (mask_bits & (1U << i))
+            {
+                u8 *ptr = data + i * imageWidth;
+                p1 = p1_arr[i]; p0 = p0_arr[i];
+                q0 = q0_arr[i]; q1 = q1_arr[i];
+                p2 = p2_arr[i]; q2 = q2_arr[i];
+
+                // Cast ABS result to u32 to match unsigned threshold
+                u32 abs_p0q0 = (u32)ABS(p0 - q0);
+                tmpFlag = (abs_p0q0 < ((thresholds->alpha >> 2) + 2))
+                          ? HANTRO_TRUE : HANTRO_FALSE;
+
+                // Filter left side (p0, p1, p2)
+                if (tmpFlag && ((u32)ABS(p2 - p0) < thresholds->beta))
+                {
+                    tmp = p1 + p0 + q0;
+                    ptr[-1] = (u8)((p2 + 2 * tmp + q1 + 4) >> 3);
+                    ptr[-2] = (u8)((p2 + tmp + 2) >> 2);
+                    ptr[-3] = (u8)((2 * ptr[-4] + 3 * p2 + tmp + 4) >> 3);
+                }
+                else
+                {
+                    ptr[-1] = (u8)((2 * p1 + p0 + q1 + 2) >> 2);
+                }
+
+                // Filter right side (q0, q1, q2)
+                if (tmpFlag && ((u32)ABS(q2 - q0) < thresholds->beta))
+                {
+                    tmp = p0 + q0 + q1;
+                    ptr[0] = (u8)((p1 + 2 * tmp + q2 + 4) >> 3);
+                    ptr[1] = (u8)((tmp + q2 + 2) >> 2);
+                    ptr[2] = (u8)((2 * ptr[3] + 3 * q2 + tmp + 4) >> 3);
+                }
+                else
+                {
+                    ptr[0] = (u8)((2 * q1 + q0 + p1 + 2) >> 2);
+                }
+            }
+        }
+        return;
+    }
+
+    // Scalar path for bS < 4 (weak filter)
     if (bS < 4)
     {
         tc = thresholds->tc0[bS-1];
@@ -709,6 +803,7 @@ void FilterVerLumaEdge(
     }
     else
     {
+        // Scalar strong filter fallback (should not be reached due to early return)
         for (i = 4; i; i--, data += imageWidth)
         {
             p1 = data[-2]; p0 = data[-1];

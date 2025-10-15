@@ -62,6 +62,7 @@
 #include "h264bsd_neighbour.h"
 #include "h264bsd_image.h"
 #include <emmintrin.h>
+#include <wasm_simd128.h>
 
 #ifdef H264DEC_OMXDL
 #include "omxtypes.h"
@@ -997,13 +998,11 @@ void Intra16x16VerticalPrediction(u8 *data, u8 *above)
     ASSERT(above);
 
     /* Load 16 bytes from above */
-    __m128i above_row = _mm_loadu_si128((__m128i*)above);
+    v128_t above_row = wasm_v128_load(above);
 
     /* Replicate the same row 16 times */
     for (int i = 0; i < 16; i++)
-    {
-        _mm_storeu_si128((__m128i*)(data + i * 16), above_row);
-    }
+        wasm_v128_store(data + i * 16, above_row);
 
 }
 
@@ -1023,10 +1022,9 @@ void Intra16x16HorizontalPrediction(u8 *data, u8 *left)
     ASSERT(left);
 
     /* Fill each row with its corresponding left pixel */
-    for (int i = 0; i < 16; i++)
-    {
-        __m128i left_val = _mm_set1_epi8(left[i]);
-        _mm_storeu_si128((__m128i*)(data + i * 16), left_val);
+    for (int i = 0; i < 16; i++) {
+        v128_t left_val = wasm_i8x16_splat(left[i]);
+        wasm_v128_store(data + i * 16, left_val);
     }
 
 }
@@ -1041,22 +1039,21 @@ void Intra16x16HorizontalPrediction(u8 *data, u8 *left)
 ------------------------------------------------------------------------------*/
 
 static inline u32 hsum_16bytes(const u8 *p) {
-    __m128i v = _mm_loadu_si128((__m128i*)p);
-    __m128i zero = _mm_setzero_si128();
+    v128_t v = wasm_v128_load(p);
 
     // Unpack bytes to 16-bit words
-    __m128i lo = _mm_unpacklo_epi8(v, zero);  // lower 8 bytes → 8x i16
-    __m128i hi = _mm_unpackhi_epi8(v, zero);  // upper 8 bytes → 8x i16
+    v128_t lo = wasm_u16x8_extend_low_u8x16(v);  // lower 8 bytes → 8x i16
+    v128_t hi = wasm_u16x8_extend_high_u8x16(v);  // upper 8 bytes → 8x i16
 
     // Add low and high halves
-    __m128i sum = _mm_add_epi16(lo, hi);      // 8x i16 sums
+    v128_t sum = wasm_i16x8_add(lo, hi);      // 8x i16 sums
 
     // Horizontal sum across 8 lanes
-    sum = _mm_add_epi16(sum, _mm_srli_si128(sum, 8));  // 4 sums
-    sum = _mm_add_epi16(sum, _mm_srli_si128(sum, 4));  // 2 sums
-    sum = _mm_add_epi16(sum, _mm_srli_si128(sum, 2));  // 1 sum
+    sum = wasm_i16x8_add(sum, wasm_i16x8_shuffle(sum, sum, 4,5,6,7,0,1,2,3));  // 4 sums
+    sum = wasm_i16x8_add(sum, wasm_i16x8_shuffle(sum, sum, 2,3,0,1,4,5,6,7));  // 2 sums
+    sum = wasm_i16x8_add(sum, wasm_i16x8_shuffle(sum, sum, 1,0,2,3,4,5,6,7));  // 1 sum
 
-    return (u32)_mm_extract_epi16(sum, 0);
+    return (u32)wasm_u16x8_extract_lane(sum, 0);
 }
 
 void Intra16x16DcPrediction(u8 *data, u8 *above, u8 *left, u32 availableA,
