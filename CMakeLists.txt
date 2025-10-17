@@ -63,4 +63,14 @@ target_link_options(h264 PRIVATE
         -sEXPORT_NAME=createH264
         -sEXPORTED_FUNCTIONS=_h264_init,_h264_set_callback,_h264_decode,_h264_reset_buffer,_h264_release,_malloc,_free
         -flto
+        -Wall
+        -Wextra
+        -Wpedantic
+        -O3
+        -msimd128
+        -ffast-math
+        -fomit-frame-pointer
+        -fno-signed-zeros
+        -fno-trapping-math
+        -fassociative-math
 )
