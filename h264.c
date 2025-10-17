@@ -11,8 +11,6 @@ static H264SwDecOutput decOutput;
 static H264SwDecPicture decPicture;
 static H264SwDecInfo decInfo;
 
-static uint32_t picDecodeNumber;
-
 // Picture callback pointer (JS registers this)
 static void (*pictureCallback)(uint8_t *yuv, int width, int height) = NULL;
 
@@ -20,30 +18,27 @@ static void (*pictureCallback)(uint8_t *yuv, int width, int height) = NULL;
 static uint8_t *streamBuffer = NULL;
 static size_t streamBufferSize = 0;
 static size_t streamBufferCapacity = 0;
-static int headersReceived = 0;
 
 #define INITIAL_BUFFER_CAPACITY (64 * 1024)  // 64KB initial capacity
 
 /*----------------------------- Initialization -----------------------------*/
 EMSCRIPTEN_KEEPALIVE
-int h264_init(int disableReordering) {
+int h264_init(int noOutputReordering) {
     if (decInst) return 0; // already initialized
 
-    H264SwDecRet ret = H264SwDecInit(&decInst, disableReordering ? 1 : 0);
+    H264SwDecRet ret = H264SwDecInit(&decInst, (u32) noOutputReordering);
     if (ret != H264SWDEC_OK) return -1;
 
     // Initialize stream buffer
     streamBufferCapacity = INITIAL_BUFFER_CAPACITY;
-    streamBuffer = (uint8_t *)malloc(streamBufferCapacity);
+    streamBuffer = malloc(streamBufferCapacity);
     if (!streamBuffer) {
         H264SwDecRelease(decInst);
         decInst = NULL;
         return -1;
     }
     streamBufferSize = 0;
-    headersReceived = 0;
 
-    picDecodeNumber = 0;
     return 0;
 }
 
@@ -64,7 +59,7 @@ int h264_decode(uint8_t *buffer, size_t length) {
         while (newCapacity < streamBufferSize + length) {
             newCapacity *= 2;
         }
-        uint8_t *newBuffer = (uint8_t *)realloc(streamBuffer, newCapacity);
+        uint8_t *newBuffer = realloc(streamBuffer, newCapacity);
         if (!newBuffer) {
             return -1; // Out of memory
         }
@@ -75,18 +70,13 @@ int h264_decode(uint8_t *buffer, size_t length) {
     // Append new data to the buffer
     memcpy(streamBuffer + streamBufferSize, buffer, length);
     streamBufferSize += length;
-
-    // Try to decode from the accumulated buffer
-    int lastRet = H264SWDEC_STRM_PROCESSED;
     
     while (streamBufferSize > 0) {
         decInput.pStream = streamBuffer;
         decInput.dataLen = streamBufferSize;
-        decInput.picId = picDecodeNumber;
         decInput.intraConcealmentMethod = 0; // gray concealment
 
         H264SwDecRet ret = H264SwDecDecode(decInst, &decInput, &decOutput);
-        lastRet = ret;
 
         // Calculate how many bytes were consumed
         size_t bytesConsumed = 0;
@@ -98,8 +88,7 @@ int h264_decode(uint8_t *buffer, size_t length) {
             // Headers ready
             case H264SWDEC_HDRS_RDY_BUFF_NOT_EMPTY: {
                 H264SwDecGetInfo(decInst, &decInfo);  // query video info
-                headersReceived = 1;
-                
+
                 // Remove consumed bytes from buffer
                 if (bytesConsumed > 0 && bytesConsumed <= streamBufferSize) {
                     memmove(streamBuffer, streamBuffer + bytesConsumed, 
@@ -113,8 +102,6 @@ int h264_decode(uint8_t *buffer, size_t length) {
             // Picture(s) ready
             case H264SWDEC_PIC_RDY:
             case H264SWDEC_PIC_RDY_BUFF_NOT_EMPTY: {
-                picDecodeNumber++; // increment after decoding
-
                 // Output all ready pictures
                 while (H264SwDecNextPicture(decInst, &decPicture, 0) == H264SWDEC_PIC_RDY) {
                     if (pictureCallback && decPicture.pOutputPicture) {
@@ -132,7 +119,7 @@ int h264_decode(uint8_t *buffer, size_t length) {
                 }
                 
                 // Continue processing if buffer not empty
-                if (ret == H264SWDEC_PIC_RDY_BUFF_NOT_EMPTY && streamBufferSize > 0) {
+                if (ret == H264SWDEC_PIC_RDY_BUFF_NOT_EMPTY) {
                     continue;
                 }
                 return ret;
@@ -182,14 +169,13 @@ int h264_decode(uint8_t *buffer, size_t length) {
         }
     }
 
-    return lastRet;
+    return 0;
 }
 
 /*----------------------------- Reset Stream Buffer ------------------------*/
 EMSCRIPTEN_KEEPALIVE
 void h264_reset_buffer(void) {
     streamBufferSize = 0;
-    headersReceived = 0;
 }
 
 /*----------------------------- Release Decoder ---------------------------*/
@@ -207,5 +193,4 @@ void h264_release(void) {
     }
     streamBufferSize = 0;
     streamBufferCapacity = 0;
-    headersReceived = 0;
 }
