@@ -19,7 +19,7 @@ static uint8_t *streamBuffer = NULL;
 static size_t streamBufferSize = 0;
 static size_t streamBufferCapacity = 0;
 
-#define INITIAL_BUFFER_CAPACITY (64 * 1024)  // 64KB initial capacity
+#define INITIAL_BUFFER_CAPACITY (512 * 1024)  // 512KB initial capacity
 
 /*----------------------------- Initialization -----------------------------*/
 EMSCRIPTEN_KEEPALIVE
