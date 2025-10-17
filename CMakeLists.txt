@@ -45,8 +45,6 @@ target_compile_options(h264 PRIVATE
         -Wpedantic
         -O3
         -msimd128
-        -msse2
-        -msse4.1
         -ffast-math
         -fomit-frame-pointer
         -fno-signed-zeros
@@ -64,8 +62,5 @@ target_link_options(h264 PRIVATE
         -sMODULARIZE=1
         -sEXPORT_NAME=createH264
         -sEXPORTED_FUNCTIONS=_h264_init,_h264_set_callback,_h264_decode,_h264_reset_buffer,_h264_release,_malloc,_free
-        -msimd128
-        -O3
         -flto
-        -ffast-math
 )

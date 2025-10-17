@@ -61,8 +61,6 @@
 #include "h264bsd_macroblock_layer.h"
 #include "h264bsd_neighbour.h"
 #include "h264bsd_image.h"
-#include <emmintrin.h>
-#include <wasm_simd128.h>
 
 #ifdef H264DEC_OMXDL
 #include "omxtypes.h"
@@ -924,6 +922,17 @@ u32 h264bsdIntraChromaPrediction(mbStorage_t *pMb, u8 *data, i32 residual[][16],
 void h264bsdAddResidual(u8 *data, i32 *residual, u32 blockNum)
 {
 
+/* Variables */
+
+    u32 i;
+    u32 x, y;
+    u32 width;
+    i32 tmp1, tmp2, tmp3, tmp4;
+    u8 *tmp;
+    const u8 *clp = h264bsdClip + 512;
+
+/* Code */
+
     ASSERT(data);
     ASSERT(residual);
     ASSERT(blockNum < 16 + 4 + 4);
@@ -933,51 +942,43 @@ void h264bsdAddResidual(u8 *data, i32 *residual, u32 blockNum)
 
     RANGE_CHECK_ARRAY(residual, -512, 511, 16);
 
-    // Use same block position logic as scalar version
-    u32 width, x, y;
-    if (blockNum < 16) {
+    if (blockNum < 16)
+    {
         width = 16;
         x = h264bsdBlockX[blockNum];
         y = h264bsdBlockY[blockNum];
-    } else {
+    }
+    else
+    {
         width = 8;
-        x = h264bsdBlockX[blockNum & 3];
-        y = h264bsdBlockY[blockNum & 3];
+        x = h264bsdBlockX[blockNum & 0x3];
+        y = h264bsdBlockY[blockNum & 0x3];
     }
 
-    u8 *ptr = data + y * width + x;
+    tmp = data + y*width + x;
+    for (i = 4; i; i--)
+    {
+        tmp1 = *residual++;
+        tmp2 = tmp[0];
+        tmp3 = *residual++;
+        tmp4 = tmp[1];
 
-    const __m128i zero = _mm_setzero_si128();
-    const __m128i max255 = _mm_set1_epi16(255);  // for saturation
+        tmp[0] = clp[tmp1 + tmp2];
 
-    // Process 4 rows
-    for (int row = 0; row < 4; row++) {
-        // Load 4 residuals (i32x4)
-        __m128i res = _mm_loadu_si128((__m128i*)(residual + row * 4));
+        tmp1 = *residual++;
+        tmp2 = tmp[2];
 
-        // Load 4 prediction pixels as u8, zero-extend to i16
-        u32 pred32 = *(u32*)(ptr);  // load 4 bytes as u32
-        __m128i pred8 = _mm_cvtsi32_si128(pred32);
-        __m128i pred16 = _mm_unpacklo_epi8(pred8, zero);  // u8 → i16
+        tmp[1] = clp[tmp3 + tmp4];
 
-        // Convert residual i32 → i16 (we assume |res| ≤ 511, so fits in i16)
-        // First, pack i32 → i16 with saturation
-        __m128i res16 = _mm_packs_epi32(res, res);  // i32x4 → i16x8 (low 4 lanes)
+        tmp3 = *residual++;
+        tmp4 = tmp[3];
 
-        // Add prediction + residual (both i16x4 in low half)
-        __m128i sum16 = _mm_add_epi16(pred16, res16);
+        tmp1 = clp[tmp1 + tmp2];
+        tmp3 = clp[tmp3 + tmp4];
+        tmp[2] = (u8)tmp1;
+        tmp[3] = (u8)tmp3;
 
-        // Saturate to [0, 255]
-        sum16 = _mm_max_epi16(sum16, zero);
-        sum16 = _mm_min_epi16(sum16, max255);
-
-        // Pack back to u8 (low 4 bytes)
-        __m128i result8 = _mm_packus_epi16(sum16, zero);  // i16x8 → u8x16
-
-        // Store low 4 bytes
-        *(u32*)ptr = _mm_cvtsi128_si32(result8);
-
-        ptr += width;
+        tmp += width;
     }
 
 }
@@ -994,15 +995,22 @@ void h264bsdAddResidual(u8 *data, i32 *residual, u32 blockNum)
 void Intra16x16VerticalPrediction(u8 *data, u8 *above)
 {
 
+/* Variables */
+
+    u32 i, j;
+
+/* Code */
+
     ASSERT(data);
     ASSERT(above);
 
-    /* Load 16 bytes from above */
-    v128_t above_row = wasm_v128_load(above);
-
-    /* Replicate the same row 16 times */
-    for (int i = 0; i < 16; i++)
-        wasm_v128_store(data + i * 16, above_row);
+    for (i = 0; i < 16; i++)
+    {
+        for (j = 0; j < 16; j++)
+        {
+            *data++ = above[j];
+        }
+    }
 
 }
 
@@ -1018,13 +1026,21 @@ void Intra16x16VerticalPrediction(u8 *data, u8 *above)
 void Intra16x16HorizontalPrediction(u8 *data, u8 *left)
 {
 
+/* Variables */
+
+    u32 i, j;
+
+/* Code */
+
     ASSERT(data);
     ASSERT(left);
 
-    /* Fill each row with its corresponding left pixel */
-    for (int i = 0; i < 16; i++) {
-        v128_t left_val = wasm_i8x16_splat(left[i]);
-        wasm_v128_store(data + i * 16, left_val);
+    for (i = 0; i < 16; i++)
+    {
+        for (j = 0; j < 16; j++)
+        {
+            *data++ = left[i];
+        }
     }
 
 }
@@ -1038,61 +1054,45 @@ void Intra16x16HorizontalPrediction(u8 *data, u8 *left)
 
 ------------------------------------------------------------------------------*/
 
-static inline u32 hsum_16bytes(const u8 *p) {
-    v128_t v = wasm_v128_load(p);
-
-    // Unpack bytes to 16-bit words
-    v128_t lo = wasm_u16x8_extend_low_u8x16(v);  // lower 8 bytes → 8x i16
-    v128_t hi = wasm_u16x8_extend_high_u8x16(v);  // upper 8 bytes → 8x i16
-
-    // Add low and high halves
-    v128_t sum = wasm_i16x8_add(lo, hi);      // 8x i16 sums
-
-    // Horizontal sum across 8 lanes
-    sum = wasm_i16x8_add(sum, wasm_i16x8_shuffle(sum, sum, 4,5,6,7,0,1,2,3));  // 4 sums
-    sum = wasm_i16x8_add(sum, wasm_i16x8_shuffle(sum, sum, 2,3,0,1,4,5,6,7));  // 2 sums
-    sum = wasm_i16x8_add(sum, wasm_i16x8_shuffle(sum, sum, 1,0,2,3,4,5,6,7));  // 1 sum
-
-    return (u32)wasm_u16x8_extract_lane(sum, 0);
-}
-
 void Intra16x16DcPrediction(u8 *data, u8 *above, u8 *left, u32 availableA,
     u32 availableB)
 {
+
+/* Variables */
+
+    u32 i, tmp;
+
+/* Code */
 
     ASSERT(data);
     ASSERT(above);
     ASSERT(left);
 
-    u8 dc_val;
-
     if (availableA && availableB)
     {
-        u32 sum_above = hsum_16bytes(above);
-        u32 sum_left  = hsum_16bytes(left);
-        dc_val = (u8)((sum_above + sum_left + 16) >> 5);
+        for (i = 0, tmp = 0; i < 16; i++)
+            tmp += above[i] + left[i];
+        tmp = (tmp + 16) >> 5;
     }
     else if (availableA)
     {
-        u32 sum_left = hsum_16bytes(left);
-        dc_val = (u8)((sum_left + 8) >> 4);
+        for (i = 0, tmp = 0; i < 16; i++)
+            tmp += left[i];
+        tmp = (tmp + 8) >> 4;
     }
     else if (availableB)
     {
-        u32 sum_above = hsum_16bytes(above);
-        dc_val = (u8)((sum_above + 8) >> 4);
+        for (i = 0, tmp = 0; i < 16; i++)
+            tmp += above[i];
+        tmp = (tmp + 8) >> 4;
     }
+    /* neither A nor B available */
     else
     {
-        dc_val = 128;
+        tmp = 128;
     }
-
-    /* Fill entire block with DC value */
-    __m128i dc_vec = _mm_set1_epi8(dc_val);
-    for (int i = 0; i < 16; i++)
-    {
-        _mm_storeu_si128((__m128i*)(data + i * 16), dc_vec);
-    }
+    for (i = 0; i < 256; i++)
+        data[i] = (u8)tmp;
 
 }
 
@@ -1262,10 +1262,16 @@ void IntraChromaHorizontalPrediction(u8 *data, u8 *left)
     ASSERT(data);
     ASSERT(left);
 
-    for (i = 0; i < 8; i++) {
-        // Broadcast left[i] to all 8 bytes of a u64
-        u64 val = (u64)(u8)left[i] * 0x0101010101010101ULL;  // replicate byte 8 times
-        *(u64*)(data + i * 8) = val;
+    for (i = 8; i--;)
+    {
+        *data++ = *left;
+        *data++ = *left;
+        *data++ = *left;
+        *data++ = *left;
+        *data++ = *left;
+        *data++ = *left;
+        *data++ = *left;
+        *data++ = *left++;
     }
 
 }
@@ -1284,7 +1290,6 @@ void IntraChromaVerticalPrediction(u8 *data, u8 *above)
 
 /* Variables */
 
-    u64 row;
     u32 i;
 
 /* Code */
@@ -1292,9 +1297,16 @@ void IntraChromaVerticalPrediction(u8 *data, u8 *above)
     ASSERT(data);
     ASSERT(above);
 
-    row = *(const u64*)above;
-    for (i = 0; i < 8; i++) {
-        *(u64*)(data + i * 8) = row;
+    for (i = 8; i--;data++/*above-=8*/)
+    {
+        data[0] = *above;
+        data[8] = *above;
+        data[16] = *above;
+        data[24] = *above;
+        data[32] = *above;
+        data[40] = *above;
+        data[48] = *above;
+        data[56] = *above++;
     }
 
 }
